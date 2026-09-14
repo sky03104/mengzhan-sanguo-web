@@ -104,6 +104,9 @@
       getAuth,
       GoogleAuthProvider,
       signInWithPopup,
+      createUserWithEmailAndPassword,
+      signInWithEmailAndPassword,
+      sendPasswordResetEmail,
     } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-auth.js";
     import {
       getFirestore,
@@ -180,6 +183,48 @@
         })
         .catch(function (error) {
           sendToUnity(requestId, { success: false, error: errorMessageOf(error) });
+        });
+    };
+
+    // ---- 2026-09-14新增：Email＋密碼登入三件套（登入方式定案，見CLAUDE.md「登入時機」段） ----
+    // 跟Google popup不同，這三個是純API呼叫、沒有彈窗，在Unity WebGL canvas裡不會被瀏覽器的
+    // 「必須由使用者手勢直接觸發」規則擋掉。失敗時多回一個errorCode（Firebase的error.code），
+    // C#端FirebaseEmailAuthService靠它翻成中文給玩家看。
+    function authFailurePayload(error) {
+      return {
+        success: false,
+        errorCode: (error && error.code) ? error.code : "unknown",
+        error: errorMessageOf(error),
+      };
+    }
+
+    window.FirebaseBridge_RegisterWithEmail = function (email, password, requestId) {
+      createUserWithEmailAndPassword(auth, email, password)
+        .then(function (cred) {
+          sendToUnity(requestId, { success: true, playerId: cred.user.uid });
+        })
+        .catch(function (error) {
+          sendToUnity(requestId, authFailurePayload(error));
+        });
+    };
+
+    window.FirebaseBridge_SignInWithEmail = function (email, password, requestId) {
+      signInWithEmailAndPassword(auth, email, password)
+        .then(function (cred) {
+          sendToUnity(requestId, { success: true, playerId: cred.user.uid });
+        })
+        .catch(function (error) {
+          sendToUnity(requestId, authFailurePayload(error));
+        });
+    };
+
+    window.FirebaseBridge_SendPasswordResetEmail = function (email, requestId) {
+      sendPasswordResetEmail(auth, email)
+        .then(function () {
+          sendToUnity(requestId, { success: true });
+        })
+        .catch(function (error) {
+          sendToUnity(requestId, authFailurePayload(error));
         });
     };
 
@@ -491,7 +536,7 @@
     // 就是這樣——線上檔案明明已更新、瀏覽器卻一直噴舊錯誤。用PRODUCT_VERSION當query string：
     // GameWebGLOnlineBuilder每次build會把版本號蓋成含git短hash，所以只有真的重新部署才會
     // 重抓那86MB，同一版重複開頁照樣吃快取。不要改成Date.now()——那會每次開頁都重抓。
-    var buildVersion = "1.0+20260914T1311.8ee3855";
+    var buildVersion = "1.0+20260914T1340.5424c75";
     var cacheBust = "?v=" + encodeURIComponent(buildVersion);
     var config = {
       dataUrl: buildUrl + "/WebGLBuild.data.unityweb" + cacheBust,
@@ -500,7 +545,7 @@
       streamingAssetsUrl: "StreamingAssets",
       companyName: "DefaultCompany",
       productName: "UnityProject",
-      productVersion: "1.0+20260914T1311.8ee3855",
+      productVersion: "1.0+20260914T1340.5424c75",
     };
 
     var canvas = document.querySelector("#unity-canvas");
