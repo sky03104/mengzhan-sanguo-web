@@ -1,0 +1,521 @@
+<!--
+  檔案位置：Assets/WebGLTemplates/FirebaseBridge/index.html
+
+  用途：Unity WebGL自訂建置範本（Unity官方規定自訂範本必須放在 Assets/WebGLTemplates/<範本名稱>/
+  底下，這是唯一沒有放進 _Project 資料夾的檔案，屬於Unity平台本身的硬性資料夾規則，不是破例）。
+  Build設定裡要選這個範本：Project Settings → Player → WebGL → Resolution and Presentation →
+  WebGL Template → 選「FirebaseBridge」。
+
+  這份檔案做兩件事：
+  1. 保留Unity官方WebGL Loader的標準骨架（canvas/loading bar/建置檔案載入）。
+     2026-08-14修正：原本用的是Unity 2019~2021的`%UNITY_XXX%`字串替換巨集，那是舊語法——
+     Unity 6改用`` mustache風格的表達式＋`#if X ... #endif`條件區塊
+     （語法對照見這台機器本地的
+     `Editor/Data/PlaybackEngines/WebGLSupport/BuildTools/WebGLTemplates/Base/Default/index.html`，
+     那是Unity官方隨編輯器附的預設範本，最權威的語法參考）。原本的寫法會讓瀏覽器對著
+     字面上的`Build/%UNITY_LOADER_FILENAME%`發請求404，loader.js根本沒載入，
+     `createUnityInstance`永遠是undefined——build本身照樣顯示Succeeded，
+     不會有任何錯誤訊息說模板壞了，只有真的在瀏覽器打開才看得出來。
+  2. 用瀏覽器端Firebase JS SDK（v10 modular，官方CDN）真正串接Auth+Firestore，
+     暴露成window.FirebaseBridge_XXX函式給.jslib呼叫，結果透過
+     window.unityInstance.SendMessage("FirebaseBridgeCallbackReceiver","OnJsCallback",json)送回Unity。
+
+  ⚠️ firebaseConfig的值直接寫死在這裡（從.env複製，非執行期讀取.env——WebGL build本身就是
+  靜態檔案，這組值本來就會被瀏覽器看到，CLAUDE.md任務說明已確認這組client端設定值不是機密，
+  安全性靠Firebase Console的Firestore Security Rules把關，不是靠藏這幾個字串）。
+-->
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>萌戰三國</title>
+  <style>
+    /*
+      2026-08-16新增：把遊戲畫面鎖在直屏比例框裡（左右留黑邊），不管瀏覽器視窗實際形狀。
+      咖哩實測回報：用桌機瀏覽器打開這個網址，畫面會撐滿整個寬螢幕視窗，Unity的直屏UI
+      （所有版面都是照1080x1920直屏設計）被硬塞進一個很寬的畫布，靠左邊緣的元素
+      （例如返回/關閉鈕）因此被擠到看不到的地方——這不是那些按鈕本身的問題（用正確的
+      1080x1920比例截圖檢查完全正常），是外層網頁沒有限制畫面比例，讓Unity的CanvasScaler
+      在極端寬高比下被迫做出失真的取捨。
+
+      做法：body用flex把#unity-container置中，容器的max-width鎖定在「視窗高度的9/16」，
+      這樣視窗只要比9:16寬（桌機、平板橫放），容器寬度就會被這條線卡住、維持9:16比例，
+      左右留黑邊；視窗本身已經是直屏（真正的手機直式握持，通常比9:16還要窄長，例如
+      iPhone常見的9:19.5），max-width算出來的值會比100vw大、不會生效，容器照舊填滿
+      整個螢幕寬高——也就是說**這個改動不會影響手機直式握持時的顯示**，只在視窗比較寬
+      （桌機測試、平板橫放、手機不小心橫放）時才會生效收窄，不需要另外判斷裝置種類。
+    */
+    html, body { margin: 0; padding: 0; height: 100%; background: #000; }
+    body { display: flex; align-items: center; justify-content: center; overflow: hidden; }
+
+    /*
+      讀取畫面背景（2026-08-14，咖哩提供的美術素材/讀取背景圖.jpg，貂蟬呂布月夜對弈）。
+      背景放在 #unity-container 而不是 #unity-canvas，因為 canvas 在 Unity 真正開始畫面前
+      是空的——把圖鋪在 canvas 底下的容器上，Unity 還沒畫完那段時間玩家看到的就是這張圖，
+      不是一片黑。canvas 本身故意不設底色（見下方），讓它在畫面畫出來之前保持透明，
+      背景圖才透得上來；body 保留黑色只是圖片載入失敗時的保底，不會出現白色破圖。
+
+      background-size: cover：手機螢幕比例五花八門，寧可裁切掉圖片邊緣，也不要出現黑邊——
+      這張圖是1024x1536接近直屏9:16，裁切量本來就不大。
+    */
+    #unity-container {
+      width: 100vw; height: 100vh;
+      max-width: calc(100vh * 9 / 16); /* 視窗比9:16寬時卡住寬度，兩側自然露出body的黑底 */
+      position: relative;
+      background-image: url('loading-bg.jpg');
+      background-size: cover;
+      background-position: center;
+      background-color: #000;
+    }
+    #unity-canvas { width: 100%; height: 100%; }
+
+    /*
+      進度文字移到畫面最下方（咖哩要求，避免壓在畫面中間的雙人對弈主體上）。
+      底下疊一層由深到淺的漸層，不管這個位置在圖片上是亮是暗，白字都保證讀得清楚——
+      這張圖左右兩側有燈籠、地板深色但零星有粉色花瓣，不是純黑，漸層比純文字陰影更保險。
+    */
+    #unity-loading-bar {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      padding: 48px 16px 28px;
+      text-align: center; color: #fff;
+      font-family: 'Microsoft JhengHei', 'Noto Sans TC', sans-serif;
+      background: linear-gradient(to top, rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0));
+    }
+    #unity-loading-text { font-size: 16px; letter-spacing: 0.05em; text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8); }
+  </style>
+</head>
+<body>
+  <div id="unity-container">
+    <canvas id="unity-canvas" tabindex="-1"></canvas>
+    <div id="unity-loading-bar">
+      <div id="unity-loading-text">載入中…</div>
+    </div>
+  </div>
+
+  <!--
+    Firebase JS SDK（v10 modular）。版本號固定寫死，之後要升級Firebase JS SDK版本時手動改這裡的
+    版本號即可，沒有自動更新機制（刻意，避免CDN上的新版本在沒測試過的情況下自動套用到正式環境）。
+  -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-app.js";
+    import {
+      getAuth,
+      GoogleAuthProvider,
+      signInWithPopup,
+    } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-auth.js";
+    import {
+      getFirestore,
+      doc,
+      getDoc,
+      setDoc,
+    } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore.js";
+    import {
+      getFunctions,
+      httpsCallable,
+    } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-functions.js";
+    // 2026-09-08新增：即時PvP用的Realtime Database（跟上面的Firestore是不同產品）。
+    // 匯入時全部改名成db開頭，避免跟已匯入的Firestore函式（doc/getDoc/setDoc）搞混。
+    import {
+      getDatabase,
+      ref as dbRef,
+      set as dbSet,
+      get as dbGet,
+      onValue as dbOnValue,
+      onDisconnect as dbOnDisconnect,
+    } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-database.js";
+
+    // 從 .env（FIREBASE_API_KEY等六個欄位）複製過來的client端設定值，非機密，見檔案頂端說明。
+    const firebaseConfig = {
+      apiKey: "AIzaSyBzJytVzlJv2E6_6bSgs42WHG-2YFmhSuY",
+      authDomain: "mengzhan-sanguo.firebaseapp.com",
+      projectId: "mengzhan-sanguo",
+      storageBucket: "mengzhan-sanguo.firebasestorage.app",
+      messagingSenderId: "422080077470",
+      appId: "1:422080077470:web:ce61056cbc979ced55e58f",
+    };
+
+    const firebaseApp = initializeApp(firebaseConfig);
+    const auth = getAuth(firebaseApp);
+    const db = getFirestore(firebaseApp);
+    // functions region必須跟firebase/functions/src/index.ts的FUNCTIONS_REGION一字不差。
+    // 2026-09-13從us-central1改成asia-east1，同時把「兩邊都不指定、靠預設值剛好對上」
+    // 改成兩邊都明寫——那種隱性耦合一旦有人改了伺服器端的region，這裡不會有任何編譯或
+    // 執行期警告，症狀是function部署成功但前端呼叫回not-found，很難查。
+    const FUNCTIONS_REGION = "asia-east1";
+    const functions = getFunctions(firebaseApp, FUNCTIONS_REGION);
+    const unlockMascotSkinCallable = httpsCallable(functions, "unlockMascotSkin");
+    // 2026-09-07新增：抽卡系統，跟上面共用同一個functions實例，region自然一致。
+    const drawMascotGachaCallable = httpsCallable(functions, "drawMascotGacha");
+    // 2026-09-08新增：武將精華指定兌換，region同上（共用同一個functions實例）。
+    const exchangeMascotEssenceCallable = httpsCallable(functions, "exchangeMascotEssence");
+
+    // playerProfiles集合名稱，跟C#端FirebasePlayerProfileRepository的假設一致，改名要兩邊一起改。
+    const PLAYER_PROFILES_COLLECTION = "playerProfiles";
+
+    function sendToUnity(requestId, payload) {
+      if (!window.unityInstance) {
+        console.error("[FirebaseBridge] window.unityInstance尚未就緒，無法送回callback。requestId=" + requestId);
+        return;
+      }
+      const json = JSON.stringify(Object.assign({ requestId: requestId }, payload));
+      window.unityInstance.SendMessage("FirebaseBridgeCallbackReceiver", "OnJsCallback", json);
+    }
+
+    function errorMessageOf(error) {
+      // Firebase JS SDK的錯誤物件通常帶.code（例如"auth/popup-closed-by-user"）跟.message，
+      // 兩個都給，方便咖哩在瀏覽器console或錯誤訊息裡判斷是哪種失敗（使用者取消 vs 設定錯誤）。
+      if (error && error.code) {
+        return error.code + ": " + (error.message || String(error));
+      }
+      return (error && error.message) || String(error);
+    }
+
+    window.FirebaseBridge_SignInWithGoogle = function (requestId) {
+      const provider = new GoogleAuthProvider();
+      signInWithPopup(auth, provider)
+        .then(function (result) {
+          sendToUnity(requestId, { success: true, playerId: result.user.uid });
+        })
+        .catch(function (error) {
+          sendToUnity(requestId, { success: false, error: errorMessageOf(error) });
+        });
+    };
+
+    window.FirebaseBridge_LoadProfile = function (playerId, requestId) {
+      const ref = doc(db, PLAYER_PROFILES_COLLECTION, playerId);
+      getDoc(ref)
+        .then(function (snap) {
+          if (!snap.exists()) {
+            sendToUnity(requestId, { success: true, exists: false });
+            return;
+          }
+          const data = snap.data();
+          sendToUnity(requestId, {
+            success: true,
+            exists: true,
+            nickname: data.nickname || "",
+            lastNicknameChangeUtc: data.lastNicknameChangeUtc || "",
+            createdAtUtc: data.createdAtUtc || "",
+            // 2026-08-13新增：擁有造型清單（同日稍晚從「擁有武將清單」改成「擁有造型清單」，
+            // 收藏單位改成造型）。舊文件沒有這欄位時data.ownedMascotSkinIds是undefined，
+            // 給空陣列，對應C#端FirebaseBridgeResponseDto.ownedMascotSkinIds為null時視為空集合的行為。
+            ownedMascotSkinIds: data.ownedMascotSkinIds || [],
+            // 2026-08-13新增：目前選定的棋靈造型id（同日稍晚從「棋靈武將id」改成「棋靈造型id」）。
+            // 舊文件沒有這欄位時給空字串，對應C#端「空字串視為null（從未設定過）」的行為
+            // （見FirebasePlayerProfileRepository）。
+            mascotSkinId: data.mascotSkinId || "",
+            // 2026-08-16新增：累積總經驗值（落地「玩家等級系統」）。舊文件沒有這欄位時給0，
+            // 對應C#端「int預設值0＝新玩家/1級」的合法狀態。
+            experiencePoints: data.experiencePoints || 0,
+            // 2026-08-26新增：抽卡系統第二階段資料層——銅錢/保底計數器/武將精華，唯讀給client
+            // （這個檔案裡完全沒有對應的FirebaseBridge_SaveCopperCoins之類函式，這是刻意的，
+            // 見FirebasePlayerProfileRepository.cs與PlayerProfile.cs的區塊註解：這些欄位只能由
+            // 之後的Cloud Function用Admin SDK寫入）。舊文件沒有這些欄位時一律給0，合法初始狀態。
+            copperCoins: data.copperCoins || 0,
+            legendaryPityCounter: data.legendaryPityCounter || 0,
+            rareOrAbovePityCounter: data.rareOrAbovePityCounter || 0,
+            commonEssence: data.commonEssence || 0,
+            eliteEssence: data.eliteEssence || 0,
+            rareEssence: data.rareEssence || 0,
+            legendaryEssence: data.legendaryEssence || 0,
+          });
+        })
+        .catch(function (error) {
+          sendToUnity(requestId, { success: false, error: errorMessageOf(error) });
+        });
+    };
+
+    window.FirebaseBridge_SaveNickname = function (
+      playerId, nickname, changedAtUtcIso, isFirstTimeSetup, createdAtUtcIso, requestId
+    ) {
+      const ref = doc(db, PLAYER_PROFILES_COLLECTION, playerId);
+      const payload = { nickname: nickname };
+
+      // isFirstTimeSetup用int(0/1)從C#傳來（見FirebaseBridgeNative.cs註解：避免bool marshaling問題）
+      const isFirstTime = isFirstTimeSetup === 1;
+
+      if (!isFirstTime) {
+        payload.lastNicknameChangeUtc = changedAtUtcIso;
+      }
+      if (isFirstTime && createdAtUtcIso) {
+        payload.createdAtUtc = createdAtUtcIso;
+      }
+
+      setDoc(ref, payload, { merge: true })
+        .then(function () {
+          sendToUnity(requestId, { success: true });
+        })
+        .catch(function (error) {
+          sendToUnity(requestId, { success: false, error: errorMessageOf(error) });
+        });
+    };
+
+    // 2026-08-26改寫：取代舊版window.FirebaseBridge_SaveOwnedMascotSkins（client端直接setDoc
+    // 覆蓋整個ownedMascotSkinIds陣列，被security-auditor抓到FAIL 2🔴——玩家開DevTools可以呼叫
+    // 該函式把自己的擁有清單覆蓋成任意內容，等於免費解鎖全部造型；見git歷史該函式舊版的完整說明）。
+    //
+    // ✅ 這裡改成呼叫Cloud Functions的unlockMascotSkin（httpsCallable會自動帶上目前
+    // auth.currentUser的ID token，伺服器端從request.auth.uid取得身份，不接受呼叫端指定任意uid），
+    // 一次只解鎖一個skinId，真正的驗證（heroId是否存在）跟寫入（Admin SDK透過Transaction+
+    // arrayUnion）都搬到firebase/functions/src/index.ts執行，client端這裡完全不再碰
+    // Firestore的ownedMascotSkinIds欄位——連讀都不用讀，Function回傳結果就夠用了。
+    //
+    // 未登入時signInWithPopup還沒完成、auth.currentUser為null，httpsCallable呼叫仍會送出去，
+    // 但Cloud Function那端會因為request.auth為null直接丟unauthenticated錯誤，同樣會被下面的
+    // .catch()接住轉成{success:false}回傳給Unity，不會讓遊戲卡住等不到回應。
+    window.FirebaseBridge_UnlockMascotSkin = function (skinId, requestId) {
+      unlockMascotSkinCallable({ skinId: skinId })
+        .then(function (result) {
+          sendToUnity(requestId, {
+            success: true,
+            skinId: (result.data && result.data.skinId) || skinId,
+            alreadyOwned: !!(result.data && result.data.alreadyOwned),
+          });
+        })
+        .catch(function (error) {
+          sendToUnity(requestId, { success: false, error: errorMessageOf(error) });
+        });
+    };
+
+    // 2026-08-13新增：棋靈選擇畫面的「設為棋靈」按鈕（同日稍晚從FirebaseBridge_SaveMascotHero
+    // 改名為FirebaseBridge_SaveMascotSkin，收藏單位改成造型）。跟ownedMascotSkinIds不同，
+    // 這裡沒有security-auditor的🔴標記——棋靈是純展示偏好設定（性質類似大頭貼），不是付費/收藏
+    // 判斷依據，client端直寫符合CLAUDE.md「棋靈切換UI規則」的定案（見CombatCore/Models/
+    // PlayerProfile.cs MascotSkinId欄位註解與IPlayerProfileRepository.SaveMascotSkinAsync介面註解）。
+    //
+    // 🟡 SECURITY（2026-08-13 security-auditor審查）：這個函式跟上面的
+    // FirebaseBridge_SaveOwnedMascotSkins有同一種結構性問題——playerId是呼叫端傳入的字串，
+    // 不是從auth.currentUser.uid取得，玩家開DevTools一樣可以對任意uid呼叫
+    // window.FirebaseBridge_SaveMascotSkin("<任意uid>", "...", "x")竄改別人的棋靈設定。
+    // 風險程度遠低於OwnedMascotSkinIds（mascotSkinId不接付費/解鎖判斷，最壞結果只是
+    // 別人的展示化身被惡搞，不會造成免費解鎖或經濟損失），所以現階段不擋交付。
+    // 但之後修OwnedMascotSkinIds的Security Rules與playerId來源問題時，這個函式要一起修
+    // （改成playerId一律從auth.currentUser.uid取得，不接受呼叫端指定），
+    // 不要漏掉變成第三個永久遺留的同款漏洞。
+    window.FirebaseBridge_SaveMascotSkin = function (playerId, mascotSkinId, requestId) {
+      const ref = doc(db, PLAYER_PROFILES_COLLECTION, playerId);
+      setDoc(ref, { mascotSkinId: mascotSkinId }, { merge: true })
+        .then(function () {
+          sendToUnity(requestId, { success: true });
+        })
+        .catch(function (error) {
+          sendToUnity(requestId, { success: false, error: errorMessageOf(error) });
+        });
+    };
+
+    // 2026-08-16新增：玩家累積總經驗值（落地CLAUDE.md「玩家等級系統」）。跟mascotSkinId同一種
+    // 風險等級——不是收藏/付費判斷依據（升級只換純展示效果，不發武將/裝備/永久貨幣），
+    // client端直寫符合CLAUDE.md定案，不需要像ownedMascotSkinIds那樣走Cloud Functions。
+    // 同樣有playerId來源的🟡結構性問題（見FirebaseBridge_SaveMascotSkin旁的說明），
+    // 風險同樣可接受（頂多被惡搞成任意等級，不造成經濟損失），暫不擋這次交付。
+    window.FirebaseBridge_SaveExperience = function (playerId, experiencePoints, requestId) {
+      const ref = doc(db, PLAYER_PROFILES_COLLECTION, playerId);
+      setDoc(ref, { experiencePoints: experiencePoints }, { merge: true })
+        .then(function () {
+          sendToUnity(requestId, { success: true });
+        })
+        .catch(function (error) {
+          sendToUnity(requestId, { success: false, error: errorMessageOf(error) });
+        });
+    };
+
+    // 2026-09-07新增：抽卡系統——呼叫Cloud Functions的drawMascotGacha（見
+    // firebase/functions/src/index.ts）。跟FirebaseBridge_UnlockMascotSkin同一套安全模式：
+    // httpsCallable自動帶上目前auth.currentUser的ID token，伺服器端從request.auth.uid取得身份，
+    // 不接受呼叫端指定任意uid；機率判定/銅錢扣款/保底計數器/精華全部在伺服器端算完才寫入，
+    // 這裡完全不碰Firestore，只是把Cloud Function的回應轉成Unity端看得懂的JSON格式送回去。
+    // 未登入時呼叫仍會送出去，但Cloud Function那端會因為request.auth為null直接丟unauthenticated
+    // 錯誤，同樣會被下面的.catch()接住轉成{success:false}，不會讓遊戲卡住等不到回應。
+    // 2026-09-08新增idempotencyKey參數：帶給drawMascotGacha的requestId欄位（伺服器端冪等性判斷，
+    // 見firebase/functions/src/index.ts的DrawMascotGachaRequest.requestId）。空字串代表不帶這個
+    // 欄位（維持舊行為，伺服器端requestId是選填的）——payload只在idempotencyKey非空時才加上
+    // requestId欄位，避免把空字串當成一個「合法但空」的requestId送過去（伺服器端會因長度0拒絕）。
+    window.FirebaseBridge_DrawMascotGacha = function (pullCount, idempotencyKey, requestId) {
+      const payload = { pullCount: pullCount };
+      if (idempotencyKey) {
+        payload.requestId = idempotencyKey;
+      }
+      drawMascotGachaCallable(payload)
+        .then(function (result) {
+          sendToUnity(requestId, {
+            success: true,
+            results: (result.data && result.data.results) || [],
+            copperCoinsRemaining: (result.data && result.data.copperCoinsRemaining) || 0,
+          });
+        })
+        .catch(function (error) {
+          sendToUnity(requestId, { success: false, error: errorMessageOf(error) });
+        });
+    };
+
+    // 2026-09-08新增：武將精華指定兌換——呼叫Cloud Functions的exchangeMascotEssence（見
+    // firebase/functions/src/index.ts）。跟FirebaseBridge_DrawMascotGacha同一套安全模式：
+    // httpsCallable自動帶上目前auth.currentUser的ID token，伺服器端從request.auth.uid取得身份，
+    // 不接受呼叫端指定任意uid；已擁有/精華不足/skinId不合法的判定與扣除全部在伺服器端算完才寫入，
+    // 這裡完全不碰Firestore，只是把Cloud Function的回應轉成Unity端看得懂的JSON格式送回去。
+    window.FirebaseBridge_ExchangeMascotEssence = function (skinId, requestId) {
+      exchangeMascotEssenceCallable({ skinId: skinId })
+        .then(function (result) {
+          sendToUnity(requestId, {
+            success: true,
+            skinId: (result.data && result.data.skinId) || skinId,
+            essenceSpent: (result.data && result.data.essenceSpent) || 0,
+            remainingEssence: (result.data && result.data.remainingEssence) || 0,
+            ownedMascotSkinIds: (result.data && result.data.ownedMascotSkinIds) || [],
+          });
+        })
+        .catch(function (error) {
+          sendToUnity(requestId, { success: false, error: errorMessageOf(error) });
+        });
+    };
+
+    // ============ 2026-09-08新增：即時PvP的Realtime Database橋接 ============
+    // RTDB跟上面用的Firestore是**不同的產品**（同一個Firebase專案底下），選它的關鍵理由是
+    // onDisconnect()：玩家拔網路線/關分頁時由Firebase伺服器端自動幫我們寫入「他離線了」，
+    // Firestore沒有這個功能（見docs/即時PvP技術方案評估_2026-09-08.md 第二節）。
+    //
+    // C#端：Assets/_Project/Scripts/Pvp/RtdbBridgeNative.cs（extern宣告）
+    //       Assets/_Project/Scripts/Pvp/RtdbBridgeCallbackReceiver.cs（接回呼）
+    // 中間層：Assets/_Project/Plugins/WebGL/FirebaseBridge.jslib
+    //
+    // ⚠️ 尚未實測（跟本檔其他Firebase功能同一種已知限制）：這段程式碼沒有在真的瀏覽器上跑過。
+    // RTDB的databaseURL沒有寫在上面的firebaseConfig裡——Firebase JS SDK在專案有啟用RTDB時
+    // 會用預設的 https://<projectId>-default-rtdb.<region>.firebasedatabase.app。
+    // **如果RTDB建立時選的region不是預設的**，就要在firebaseConfig加上databaseURL欄位，
+    // 這是接真機時第一個要確認的事。
+
+    const rtdb = getDatabase(firebaseApp);
+
+    // subscriptionId → RTDB的unsubscribe函式。取消訂閱時要用得到。
+    const rtdbSubscriptions = {};
+
+    function sendRtdbRequest(requestId, payload) {
+      if (!window.unityInstance) {
+        console.error("[RtdbBridge] window.unityInstance尚未就緒。requestId=" + requestId);
+        return;
+      }
+      const json = JSON.stringify(Object.assign({ requestId: requestId }, payload));
+      window.unityInstance.SendMessage("RtdbBridgeCallbackReceiver", "OnRtdbRequestCallback", json);
+    }
+
+    function sendRtdbValue(subscriptionId, value) {
+      if (!window.unityInstance) return;
+      const json = JSON.stringify({ subscriptionId: subscriptionId, success: true, value: value });
+      window.unityInstance.SendMessage("RtdbBridgeCallbackReceiver", "OnRtdbValueChanged", json);
+    }
+
+    // 節點內容一律以「字串化過的JSON」在C#↔JS之間傳遞（value欄位），不直接內嵌成物件：
+    // Unity的JsonUtility沒辦法解析未知結構的巢狀物件，C#端拿到字串後才交給System.Text.Json解析。
+    function stringifyNode(snapshotValue) {
+      return snapshotValue === null || snapshotValue === undefined ? "" : JSON.stringify(snapshotValue);
+    }
+
+    window.RtdbBridge_Set = function (path, json, requestId) {
+      let parsed;
+      try {
+        parsed = JSON.parse(json);
+      } catch (error) {
+        sendRtdbRequest(requestId, { success: false, error: "C#傳來的JSON無法解析：" + String(error) });
+        return;
+      }
+      dbSet(dbRef(rtdb, path), parsed)
+        .then(function () { sendRtdbRequest(requestId, { success: true }); })
+        .catch(function (error) { sendRtdbRequest(requestId, { success: false, error: errorMessageOf(error) }); });
+    };
+
+    window.RtdbBridge_Get = function (path, requestId) {
+      dbGet(dbRef(rtdb, path))
+        .then(function (snap) {
+          sendRtdbRequest(requestId, { success: true, value: snap.exists() ? stringifyNode(snap.val()) : "" });
+        })
+        .catch(function (error) { sendRtdbRequest(requestId, { success: false, error: errorMessageOf(error) }); });
+    };
+
+    window.RtdbBridge_ListChildKeys = function (path, requestId) {
+      dbGet(dbRef(rtdb, path))
+        .then(function (snap) {
+          const value = snap.exists() ? snap.val() : null;
+          const keys = value && typeof value === "object" ? Object.keys(value) : [];
+          sendRtdbRequest(requestId, { success: true, childKeys: keys });
+        })
+        .catch(function (error) { sendRtdbRequest(requestId, { success: false, error: errorMessageOf(error) }); });
+    };
+
+    window.RtdbBridge_Subscribe = function (path, subscriptionId) {
+      // onValue訂閱當下就會回呼一次目前的值，這正是C#端 IRealtimeDatabase.SubscribeValue 約定的行為
+      // （見該介面註解：「訂閱當下會立刻用目前的值回呼一次」），兩邊語意一致，不用額外補一次get。
+      const unsubscribe = dbOnValue(dbRef(rtdb, path), function (snap) {
+        sendRtdbValue(subscriptionId, snap.exists() ? stringifyNode(snap.val()) : "");
+      }, function (error) {
+        console.error("[RtdbBridge] 監聽" + path + "失敗：" + errorMessageOf(error));
+      });
+      rtdbSubscriptions[subscriptionId] = unsubscribe;
+    };
+
+    window.RtdbBridge_Unsubscribe = function (subscriptionId) {
+      const unsubscribe = rtdbSubscriptions[subscriptionId];
+      if (unsubscribe) {
+        unsubscribe();
+        delete rtdbSubscriptions[subscriptionId];
+      }
+    };
+
+    window.RtdbBridge_OnDisconnectSet = function (path, json, requestId) {
+      let parsed;
+      try {
+        parsed = JSON.parse(json);
+      } catch (error) {
+        sendRtdbRequest(requestId, { success: false, error: "C#傳來的JSON無法解析：" + String(error) });
+        return;
+      }
+      dbOnDisconnect(dbRef(rtdb, path)).set(parsed)
+        .then(function () { sendRtdbRequest(requestId, { success: true }); })
+        .catch(function (error) { sendRtdbRequest(requestId, { success: false, error: errorMessageOf(error) }); });
+    };
+  </script>
+
+  <!--
+    Unity WebGL Loader標準骨架。2026-08-14改用Unity 6正確的
+    ``／`#if...#endif`語法（見檔案頂端說明），照抄本機Unity安裝目錄裡的
+    Default範本結構：先動態插入<script src="Build/WebGLBuild.loader.js">，
+    它的onload才呼叫全域函式createUnityInstance——這一步順序不能反過來，
+    loader腳本標籤若直接寫死在HTML裡（不用onload等待），createUnityInstance在腳本真正
+    載入完成前就會被呼叫，一樣是undefined。
+  -->
+  <script>
+    var buildUrl = "Build";
+    var config = {
+      dataUrl: buildUrl + "/WebGLBuild.data.unityweb",
+      frameworkUrl: buildUrl + "/WebGLBuild.framework.js.unityweb",
+      codeUrl: buildUrl + "/WebGLBuild.wasm.unityweb",
+      streamingAssetsUrl: "StreamingAssets",
+      companyName: "DefaultCompany",
+      productName: "UnityProject",
+      productVersion: "1.0",
+    };
+
+    var canvas = document.querySelector("#unity-canvas");
+    var loadingText = document.querySelector("#unity-loading-text");
+
+    var script = document.createElement("script");
+    script.src = buildUrl + "/WebGLBuild.loader.js";
+    script.onload = function () {
+      createUnityInstance(canvas, config, function (progress) {
+        loadingText.innerText = "載入中… " + Math.round(progress * 100) + "%";
+      }).then(function (instance) {
+        // 全域暴露unityInstance，讓上方Firebase橋接程式碼跟FirebaseBridge.jslib都能呼叫
+        // instance.SendMessage(...)。這行是整個橋接機制能運作的關鍵前提，
+        // FirebaseBridgeCallbackReceiver.cs頂端註解也提到這一點。
+        window.unityInstance = instance;
+        document.querySelector("#unity-loading-bar").style.display = "none";
+      }).catch(function (message) {
+        console.error("[FirebaseBridge] Unity WebGL Loader初始化失敗：" + message);
+        loadingText.innerText = "載入失敗，請重新整理頁面";
+      });
+    };
+    document.body.appendChild(script);
+  </script>
+</body>
+</html>
