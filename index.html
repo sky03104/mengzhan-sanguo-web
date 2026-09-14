@@ -486,21 +486,28 @@
   -->
   <script>
     var buildUrl = "Build";
+    // 快取破壞（2026-09-14加）：GitHub Pages不能設Cache-Control header，瀏覽器會把.unityweb
+    // 快取很久；重新部署後玩家（跟我們自己）常常還在跑舊版，第一次修.jslib的__deps bug時
+    // 就是這樣——線上檔案明明已更新、瀏覽器卻一直噴舊錯誤。用PRODUCT_VERSION當query string：
+    // GameWebGLOnlineBuilder每次build會把版本號蓋成含git短hash，所以只有真的重新部署才會
+    // 重抓那86MB，同一版重複開頁照樣吃快取。不要改成Date.now()——那會每次開頁都重抓。
+    var buildVersion = "1.0+20260914T1311.8ee3855";
+    var cacheBust = "?v=" + encodeURIComponent(buildVersion);
     var config = {
-      dataUrl: buildUrl + "/WebGLBuild.data.unityweb",
-      frameworkUrl: buildUrl + "/WebGLBuild.framework.js.unityweb",
-      codeUrl: buildUrl + "/WebGLBuild.wasm.unityweb",
+      dataUrl: buildUrl + "/WebGLBuild.data.unityweb" + cacheBust,
+      frameworkUrl: buildUrl + "/WebGLBuild.framework.js.unityweb" + cacheBust,
+      codeUrl: buildUrl + "/WebGLBuild.wasm.unityweb" + cacheBust,
       streamingAssetsUrl: "StreamingAssets",
       companyName: "DefaultCompany",
       productName: "UnityProject",
-      productVersion: "1.0",
+      productVersion: "1.0+20260914T1311.8ee3855",
     };
 
     var canvas = document.querySelector("#unity-canvas");
     var loadingText = document.querySelector("#unity-loading-text");
 
     var script = document.createElement("script");
-    script.src = buildUrl + "/WebGLBuild.loader.js";
+    script.src = buildUrl + "/WebGLBuild.loader.js" + cacheBust;
     script.onload = function () {
       createUnityInstance(canvas, config, function (progress) {
         loadingText.innerText = "載入中… " + Math.round(progress * 100) + "%";
