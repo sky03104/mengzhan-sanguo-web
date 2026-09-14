@@ -536,7 +536,7 @@
     // 就是這樣——線上檔案明明已更新、瀏覽器卻一直噴舊錯誤。用PRODUCT_VERSION當query string：
     // GameWebGLOnlineBuilder每次build會把版本號蓋成含git短hash，所以只有真的重新部署才會
     // 重抓那86MB，同一版重複開頁照樣吃快取。不要改成Date.now()——那會每次開頁都重抓。
-    var buildVersion = "1.0+20260914T1746.71102ff";
+    var buildVersion = "1.0+20260914T2328.1c62f6c";
     var cacheBust = "?v=" + encodeURIComponent(buildVersion);
     var config = {
       dataUrl: buildUrl + "/WebGLBuild.data.unityweb" + cacheBust,
@@ -545,7 +545,7 @@
       streamingAssetsUrl: "StreamingAssets",
       companyName: "DefaultCompany",
       productName: "UnityProject",
-      productVersion: "1.0+20260914T1746.71102ff",
+      productVersion: "1.0+20260914T2328.1c62f6c",
     };
 
     var canvas = document.querySelector("#unity-canvas");
